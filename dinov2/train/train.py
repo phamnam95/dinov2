@@ -207,6 +207,9 @@ def do_train(cfg, model, resume=False):
         sampler_type=sampler_type,
         sampler_advance=0,  # TODO(qas): fix this -- start_iter * cfg.train.batch_size_per_gpu,
         drop_last=True,
+        persistent_workers=cfg.train.persistent_workers,
+        pin_memory=cfg.train.pin_memory,
+        prefetch_factor=cfg.train.prefetch_factor,
         collate_fn=collate_fn,
     )
 

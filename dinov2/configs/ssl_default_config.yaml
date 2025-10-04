@@ -65,6 +65,9 @@ train:
   saveckp_freq: 20
   seed: 0
   num_workers: 10
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: false
   OFFICIAL_EPOCH_LENGTH: 1250
   cache_dataset: true
   centering: "centering" # or "sinkhorn_knopp"
