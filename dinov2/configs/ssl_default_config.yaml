@@ -58,20 +58,60 @@ ibot:
   head_bottleneck_dim: 256
   head_nlayers: 3
   head_hidden_dim: 2048
+  # Optional frequency-domain masking for inputs (applied to crops)
+  freq_mask:
+    enabled: false
+    prob: 0.5
+    # Either specify fixed cutoffs (low/high) or ranges below for per-sample sampling
+    low: 0.05        # normalized low cutoff (0..0.5)
+    high: 0.25       # normalized high cutoff (0..0.5)
+    per_sample: false
+    low_range: [0.02, 0.10]   # used when per_sample: true
+    high_range: [0.20, 0.40]  # used when per_sample: true
+    mode: bandpass  # bandpass|lowpass|highpass
 train:
   batch_size_per_gpu: 64
   dataset_path: ImageNet:split=TRAIN
   output_dir: .
   saveckp_freq: 20
   seed: 0
-  num_workers: 10
+  num_workers: 6
   OFFICIAL_EPOCH_LENGTH: 1250
-  cache_dataset: true
+  cache_dataset: false
   centering: "centering" # or "sinkhorn_knopp"
+  # DataLoader memory controls (tune per cluster)
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+  shm_sharing_strategy: file_system  # or 'file_descriptor'
+  # Optional xarray/xbatcher loader
+  use_xarray: false
+  xarray:
+    dataset_path: ''  # path to Zarr/NetCDF dataset
+    image_var: 'image'  # [H,W,C] or [C,H,W]
+    target_var: ''
+    chunks: {sample: 1024}
+    to_chw: true
+    normalize: true
+  # Tiling for large 2D/3D inputs
+  tiling:
+    enabled: false
+    is_3d: false
+    tile_size: [512, 512]      # or [D,H,W] for 3D
+    stride: [512, 512]         # or [D,H,W] for 3D
+    drop_last_tiles: true
+  # Performance features
+  torch_compile: false
+  torch_compile_mode: reduce-overhead  # reduce-overhead|max-autotune
+  channels_last: true  # 2D only; ignored in 3D
+  accumulate_steps: 1
 student:
   arch: vit_large
   patch_size: 16
+  # set is_3d: true for 3D inputs (and then use tuple patch_size, e.g. [2,16,16])
+  is_3d: false
   drop_path_rate: 0.3
+  activation_checkpointing: false
   layerscale: 1.0e-05
   drop_path_uniform: true
   pretrained_weights: ''
@@ -83,6 +123,15 @@ student:
   num_register_tokens: 0
   interpolate_antialias: false
   interpolate_offset: 0.1
+  # Optional model-parallel device list; example to use 4 GPUs on one node
+  # Set to [] or remove to disable model parallel.
+  mp_devices: [0, 1, 2, 3]
+  lora:
+    enabled: false
+    r: 8
+    alpha: 16.0
+    dropout: 0.0
+    targets: ["qkv", "proj", "fc1", "fc2"]
 teacher:
   momentum_teacher: 0.992
   final_momentum_teacher: 1

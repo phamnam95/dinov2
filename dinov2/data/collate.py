@@ -4,6 +4,7 @@
 # found in the LICENSE file in the root directory of this source tree.
 
 import torch
+import math
 import random
 
 
@@ -34,7 +35,23 @@ def collate_data_and_cast(samples_list, mask_ratio_tuple, mask_probability, dtyp
     random.shuffle(masks_list)
 
     collated_masks = torch.stack(masks_list).flatten(1)
-    mask_indices_list = collated_masks.flatten().nonzero().flatten()
+
+    # Build data-missing mask at token level from NaNs in inputs (global crops only)
+    # Detect missing pixels across channels, then aggregate per patch token
+    C, H, W = collated_global_crops.shape[1:]
+    M = int(math.sqrt(N)) if N is not None else None
+    if N is not None and M * M == N and H % M == 0 and W % M == 0:
+        missing_pixels = torch.isnan(collated_global_crops).any(dim=1)  # [B,H,W]
+        ph, pw = H // M, W // M
+        missing_tokens = (
+            missing_pixels.view(B, M, ph, M, pw).any(-1).any(-2).view(B, N)
+        )  # [B,N]
+    else:
+        missing_tokens = torch.zeros((B, N), dtype=torch.bool, device=collated_global_crops.device)
+
+    # Exclude missing tokens from iBOT masked indices
+    effective_ibot_masks = collated_masks & (~missing_tokens)
+    mask_indices_list = effective_ibot_masks.flatten().nonzero().flatten()
 
     masks_weight = (1 / collated_masks.sum(-1).clamp(min=1.0)).unsqueeze(-1).expand_as(collated_masks)[collated_masks]
 
@@ -42,6 +59,7 @@ def collate_data_and_cast(samples_list, mask_ratio_tuple, mask_probability, dtyp
         "collated_global_crops": collated_global_crops.to(dtype),
         "collated_local_crops": collated_local_crops.to(dtype),
         "collated_masks": collated_masks,
+        "data_missing_tokens": missing_tokens,
         "mask_indices_list": mask_indices_list,
         "masks_weight": masks_weight,
         "upperbound": upperbound,

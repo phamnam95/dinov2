@@ -5,12 +5,19 @@
 
 import logging
 from enum import Enum
-from typing import Any, Callable, List, Optional, TypeVar
+from typing import Any, Callable, List, Optional, TypeVar, Tuple, Union, Iterable
 
 import torch
-from torch.utils.data import Sampler
+from torch.utils.data import Sampler, IterableDataset, get_worker_info
 
 from .datasets import ImageNet, ImageNet22k
+
+try:
+    import xarray as xr  # type: ignore
+    from xbatcher import BatchGenerator  # type: ignore
+    _XR_AVAILABLE = True
+except Exception:
+    _XR_AVAILABLE = False
 from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
 
 
@@ -176,6 +183,8 @@ def make_data_loader(
     drop_last: bool = True,
     persistent_workers: bool = False,
     collate_fn: Optional[Callable[[List[T]], Any]] = None,
+    pin_memory: bool = True,
+    prefetch_factor: int = 2,
 ):
     """
     Creates a data loader with the specified parameters.
@@ -209,7 +218,8 @@ def make_data_loader(
         sampler=sampler,
         batch_size=batch_size,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
         drop_last=drop_last,
         persistent_workers=persistent_workers,
         collate_fn=collate_fn,
@@ -220,3 +230,213 @@ def make_data_loader(
     except TypeError:  # data loader has no length
         logger.info("infinite data loader")
     return data_loader
+
+
+# ---------------------- Optional tiling for large inputs ----------------------
+try:
+    from torchvision.transforms.functional import crop as tv_crop
+except Exception:
+    tv_crop = None  # type: ignore
+
+
+def _compute_starts(size: int, tile: int, stride: int, drop_last: bool) -> List[int]:
+    if tile >= size:
+        return [0]
+    starts = list(range(0, size - tile + 1, stride))
+    if not drop_last:
+        last_start = size - tile
+        if starts[-1] != last_start:
+            starts.append(last_start)
+    return starts
+
+
+def _iter_tiles_2d(img, tile_hw: Tuple[int, int], stride_hw: Tuple[int, int], drop_last: bool):
+    # img can be PIL Image or Tensor [C,H,W]
+    if torch.is_tensor(img):
+        _, H, W = img.shape
+    else:
+        W, H = img.size  # PIL
+    th, tw = tile_hw
+    sh, sw = stride_hw
+    hs = _compute_starts(H, th, sh, drop_last)
+    ws = _compute_starts(W, tw, sw, drop_last)
+    for top in hs:
+        for left in ws:
+            if torch.is_tensor(img):
+                yield img[:, top : top + th, left : left + tw], (top, left)
+            else:
+                assert tv_crop is not None, "torchvision is required for 2D PIL tiling"
+                tile = tv_crop(img, top, left, th, tw)
+                yield tile, (top, left)
+
+
+def _iter_tiles_3d(vol: torch.Tensor, tile_dhw: Tuple[int, int, int], stride_dhw: Tuple[int, int, int], drop_last: bool):
+    # vol: Tensor [C,D,H,W]
+    _, D, H, W = vol.shape
+    td, th, tw = tile_dhw
+    sd, sh, sw = stride_dhw
+    ds = _compute_starts(D, td, sd, drop_last)
+    hs = _compute_starts(H, th, sh, drop_last)
+    ws = _compute_starts(W, tw, sw, drop_last)
+    for z in ds:
+        for y in hs:
+            for x in ws:
+                yield vol[:, z : z + td, y : y + th, x : x + tw], (z, y, x)
+
+
+class TiledIterableDataset(IterableDataset):
+    def __init__(
+        self,
+        base_dataset,
+        *,
+        is_3d: bool,
+        tile_size: Union[Tuple[int, int], Tuple[int, int, int]],
+        stride: Union[Tuple[int, int], Tuple[int, int, int]],
+        drop_last_tiles: bool = True,
+        transform=None,
+    ):
+        super().__init__()
+        self.base_dataset = base_dataset
+        self.is_3d = is_3d
+        self.tile_size = tile_size
+        self.stride = stride
+        self.drop_last_tiles = drop_last_tiles
+        self.transform = transform
+
+    def _sharded_indices(self) -> Iterable[int]:
+        # Shard base sample indices across distributed processes and dataloader workers
+        world_size = distributed.get_global_size()
+        global_rank = distributed.get_global_rank()
+
+        worker = get_worker_info()
+        if worker is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = worker.id
+            num_workers = worker.num_workers
+
+        step = max(1, world_size * num_workers)
+        offset = global_rank * num_workers + worker_id
+        for idx in range(offset, len(self.base_dataset), step):
+            yield idx
+
+    def __iter__(self):
+        for idx in self._sharded_indices():
+            sample = self.base_dataset[idx]
+            if isinstance(sample, tuple):
+                img, target = sample
+            else:
+                img, target = sample, None
+
+            if self.is_3d:
+                assert torch.is_tensor(img) and img.dim() == 4, "3D tiling expects Tensor [C,D,H,W]"
+                for tile, offs in _iter_tiles_3d(img, self.tile_size, self.stride, self.drop_last_tiles):
+                    out = self.transform(tile) if self.transform is not None else tile
+                    if isinstance(out, dict):
+                        out["tile_origin"] = offs
+                    yield (out, target)
+            else:
+                for tile, offs in _iter_tiles_2d(img, self.tile_size, self.stride, self.drop_last_tiles):
+                    out = self.transform(tile) if self.transform is not None else tile
+                    if isinstance(out, dict):
+                        out["tile_origin"] = offs
+                    yield (out, target)
+
+
+def make_tiled_iterable_dataset(
+    *,
+    dataset,
+    is_3d: bool,
+    tile_size: Union[Tuple[int, int], Tuple[int, int, int]],
+    stride: Union[Tuple[int, int], Tuple[int, int, int]],
+    drop_last_tiles: bool,
+    transform=None,
+):
+    return TiledIterableDataset(
+        dataset,
+        is_3d=is_3d,
+        tile_size=tuple(tile_size),
+        stride=tuple(stride),
+        drop_last_tiles=drop_last_tiles,
+        transform=transform,
+    )
+
+
+def make_xarray_loader(
+    *,
+    ds_path: str,
+    image_var: str,
+    target_var: Optional[str] = None,
+    batch_size: int,
+    num_workers: int = 0,
+    to_chw: bool = True,
+    normalize: bool = True,
+    chunks: Optional[dict] = None,
+    tiling: Optional[dict] = None,
+):
+    if not _XR_AVAILABLE:
+        raise RuntimeError("xarray/xbatcher not available; please install xarray and xbatcher.")
+
+    ds = xr.open_zarr(ds_path) if ds_path.endswith(".zarr") else xr.open_dataset(ds_path)
+    if chunks:
+        ds = ds.chunk(chunks)
+
+    img = ds[image_var]
+    tgt = ds[target_var] if target_var and target_var in ds else None
+
+    # Expect a leading sample dimension; name may vary
+    sample_dim = img.dims[0]
+    if tiling and tiling.get("enabled", False):
+        # Determine spatial dims for tiling
+        is_3d = bool(tiling.get("is_3d", False))
+        tile_size = tuple(tiling.get("tile_size"))
+        stride = tuple(tiling.get("stride"))
+
+        # Build dimension dict for xbatcher: batch over samples and window over spatial dims
+        if is_3d:
+            # assume dims: (sample, D, H, W, C) or (sample, C, D, H, W)
+            spatial_dims = [d for d in img.dims if d not in (sample_dim,)]
+            # pick last 3 as D,H,W
+            dhw = spatial_dims[-3:]
+            input_dims = {
+                image_var: {
+                    sample_dim: batch_size,
+                    dhw[0]: tile_size[0],
+                    dhw[1]: tile_size[1],
+                    dhw[2]: tile_size[2],
+                }
+            }
+            bg = BatchGenerator(ds, input_dims=input_dims, steps={dhw[0]: stride[0], dhw[1]: stride[1], dhw[2]: stride[2]}, shuffle=True)
+        else:
+            # 2D: pick last 2 spatial dims as H,W
+            spatial_dims = [d for d in img.dims if d not in (sample_dim,)]
+            hw = spatial_dims[-2:]
+            input_dims = {
+                image_var: {sample_dim: batch_size, hw[0]: tile_size[0], hw[1]: tile_size[1]}
+            }
+            bg = BatchGenerator(ds, input_dims=input_dims, steps={hw[0]: stride[0], hw[1]: stride[1]}, shuffle=True)
+    else:
+        bg = BatchGenerator(ds, input_dims={image_var: {sample_dim: batch_size}}, shuffle=True)
+
+    def _to_tensor(npx):
+        import numpy as np
+        import torch
+
+        arr = npx.values  # NumPy array
+        if to_chw and arr.shape[-1] in (1, 3):
+            arr = arr.transpose(0, 3, 1, 2)
+        t = torch.from_numpy(arr).float()
+        if normalize:
+            t = t / 255.0
+        return t
+
+    def _iter():
+        for batch in bg:
+            images = _to_tensor(batch[image_var])
+            targets = None
+            if tgt is not None:
+                targets = torch.from_numpy(batch[target_var].values)
+            yield [(dict(global_crops=[img for img in images[:2]], local_crops=list(images[2:])), targets)]
+
+    return _iter()

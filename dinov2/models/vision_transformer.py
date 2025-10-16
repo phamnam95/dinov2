@@ -10,7 +10,7 @@
 from functools import partial
 import math
 import logging
-from typing import Sequence, Tuple, Union, Callable
+from typing import Sequence, Tuple, Union, Callable, List
 
 import numpy as np
 import torch
@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.utils.checkpoint
 from torch.nn.init import trunc_normal_
 
-from dinov2.layers import Mlp, PatchEmbed, SwiGLUFFNFused, MemEffAttention, NestedTensorBlock as Block
+from dinov2.layers import Mlp, PatchEmbed, PatchEmbed3D, SwiGLUFFNFused, MemEffAttention, NestedTensorBlock as Block
 
 
 logger = logging.getLogger("dinov2")
@@ -66,6 +66,8 @@ class DinoVisionTransformer(nn.Module):
         num_register_tokens=0,
         interpolate_antialias=False,
         interpolate_offset=0.1,
+        is_3d: bool = False,
+        mp_devices: Union[Sequence[Union[int, str, torch.device]], None] = None,
     ):
         """
         Args:
@@ -100,11 +102,19 @@ class DinoVisionTransformer(nn.Module):
         self.n_blocks = depth
         self.num_heads = num_heads
         self.patch_size = patch_size
+        self.is_3d = is_3d
         self.num_register_tokens = num_register_tokens
         self.interpolate_antialias = interpolate_antialias
         self.interpolate_offset = interpolate_offset
 
-        self.patch_embed = embed_layer(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        if is_3d:
+            self.patch_embed = PatchEmbed3D(
+                img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim
+            )
+        else:
+            self.patch_embed = embed_layer(
+                img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim
+            )
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -170,6 +180,99 @@ class DinoVisionTransformer(nn.Module):
 
         self.init_weights()
 
+        # Optional model-parallel setup across multiple CUDA devices
+        self.model_parallel = False
+        if mp_devices:
+            self._setup_model_parallel(mp_devices)
+
+    # -------------------- Model Parallel Helpers --------------------
+    def _normalize_devices(self, mp_devices: Sequence[Union[int, str, torch.device]]):
+        devices: List[torch.device] = []
+        for d in mp_devices:
+            if isinstance(d, torch.device):
+                devices.append(d)
+            elif isinstance(d, int):
+                devices.append(torch.device(f"cuda:{d}"))
+            elif isinstance(d, str):
+                # allow forms like "cuda", "cuda:0"
+                if d == "cuda":
+                    devices.append(torch.device("cuda:0"))
+                else:
+                    devices.append(torch.device(d))
+            else:
+                raise ValueError(f"Unsupported device spec: {d}")
+        if not devices:
+            raise ValueError("mp_devices must contain at least one device")
+        return devices
+
+    def _compute_stage_splits(self, total: int, stages: int):
+        # Return list of (start, end) indices partitioning [0, total)
+        base = total // stages
+        rem = total % stages
+        splits = []
+        start = 0
+        for i in range(stages):
+            length = base + (1 if i < rem else 0)
+            end = start + length
+            splits.append((start, end))
+            start = end
+        return splits
+
+    def _iter_all_block_modules(self):
+        if self.chunked_blocks:
+            for chunk in self.blocks:
+                # BlockChunk is a ModuleList
+                for sub in chunk:
+                    if isinstance(sub, nn.Identity):
+                        continue
+                    yield sub
+        else:
+            for blk in self.blocks:
+                yield blk
+
+    def _setup_model_parallel(self, mp_devices: Sequence[Union[int, str, torch.device]]):
+        if not torch.cuda.is_available():
+            logger.warning("Model parallel requested but CUDA is not available. Ignoring.")
+            return
+        devices = self._normalize_devices(mp_devices)
+        if len(devices) == 1:
+            # nothing to do
+            return
+        if self.chunked_blocks:
+            # We could support this by moving sub-blocks individually, but it's error-prone.
+            raise NotImplementedError("Model parallel is not supported when block_chunks > 0")
+
+        self.mp_devices: List[torch.device] = devices
+        self.stage_splits = self._compute_stage_splits(self.n_blocks, len(devices))
+
+        # Build a per-block device map
+        block_devices: List[torch.device] = [devices[0]] * self.n_blocks
+        for stage_idx, (s, e) in enumerate(self.stage_splits):
+            for i in range(s, e):
+                block_devices[i] = devices[stage_idx]
+        self._block_devices = block_devices
+
+        # Move embedding and tokens to first device
+        first_device = devices[0]
+        self.patch_embed.to(first_device)
+        self.cls_token = nn.Parameter(self.cls_token.to(first_device))
+        self.pos_embed = nn.Parameter(self.pos_embed.to(first_device))
+        if self.register_tokens is not None:
+            self.register_tokens = nn.Parameter(self.register_tokens.to(first_device))
+        self.mask_token = nn.Parameter(self.mask_token.to(first_device))
+
+        # Move transformer blocks to their target devices
+        for i, blk in enumerate(self._iter_all_block_modules()):
+            target = block_devices[i]
+            blk.to(target)
+
+        # Move norm and head to the last device
+        last_device = devices[-1]
+        self.norm.to(last_device)
+        self.head.to(last_device)
+
+        self.model_parallel = True
+
     def init_weights(self):
         trunc_normal_(self.pos_embed, std=0.02)
         nn.init.normal_(self.cls_token, std=1e-6)
@@ -177,48 +280,91 @@ class DinoVisionTransformer(nn.Module):
             nn.init.normal_(self.register_tokens, std=1e-6)
         named_apply(init_weights_vit_timm, self)
 
-    def interpolate_pos_encoding(self, x, w, h):
+    def interpolate_pos_encoding(self, x, w, h, d=None):
         previous_dtype = x.dtype
         npatch = x.shape[1] - 1
         N = self.pos_embed.shape[1] - 1
-        if npatch == N and w == h:
+        if not self.is_3d and npatch == N and w == h:
             return self.pos_embed
         pos_embed = self.pos_embed.float()
         class_pos_embed = pos_embed[:, 0]
         patch_pos_embed = pos_embed[:, 1:]
         dim = x.shape[-1]
-        w0 = w // self.patch_size
-        h0 = h // self.patch_size
-        M = int(math.sqrt(N))  # Recover the number of patches in each dimension
-        assert N == M * M
+        if self.is_3d:
+            assert d is not None, "depth must be provided for 3D positional encoding"
+            # patch_size may be a tuple (Dz, Dy, Dx)
+            if isinstance(self.patch_size, tuple):
+                pd, ph, pw = self.patch_size
+            else:
+                pd = ph = pw = self.patch_size
+            w0 = w // pw
+            h0 = h // ph
+            d0 = d // pd
+            M = round(N ** (1 / 3))
+            assert N == M * M * M
+        else:
+            w0 = w // self.patch_size
+            h0 = h // self.patch_size
+            M = int(math.sqrt(N))  # Recover the number of patches in each dimension
+            assert N == M * M
         kwargs = {}
         if self.interpolate_offset:
             # Historical kludge: add a small number to avoid floating point error in the interpolation, see https://github.com/facebookresearch/dino/issues/8
             # Note: still needed for backward-compatibility, the underlying operators are using both output size and scale factors
-            sx = float(w0 + self.interpolate_offset) / M
-            sy = float(h0 + self.interpolate_offset) / M
-            kwargs["scale_factor"] = (sx, sy)
+            if self.is_3d:
+                sx = float(w0 + self.interpolate_offset) / M
+                sy = float(h0 + self.interpolate_offset) / M
+                sz = float(d0 + self.interpolate_offset) / M
+                kwargs["scale_factor"] = (sx, sy, sz)
+            else:
+                sx = float(w0 + self.interpolate_offset) / M
+                sy = float(h0 + self.interpolate_offset) / M
+                kwargs["scale_factor"] = (sx, sy)
         else:
             # Simply specify an output size instead of a scale factor
-            kwargs["size"] = (w0, h0)
-        patch_pos_embed = nn.functional.interpolate(
-            patch_pos_embed.reshape(1, M, M, dim).permute(0, 3, 1, 2),
-            mode="bicubic",
-            antialias=self.interpolate_antialias,
-            **kwargs,
-        )
-        assert (w0, h0) == patch_pos_embed.shape[-2:]
-        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
+            if self.is_3d:
+                kwargs["size"] = (d0, w0, h0)
+            else:
+                kwargs["size"] = (w0, h0)
+        if self.is_3d:
+            # reshape to (1, C, D, H, W)
+            patch_pos_embed = patch_pos_embed.reshape(1, M, M, M, dim).permute(0, 4, 1, 2, 3)
+            patch_pos_embed = nn.functional.interpolate(
+                patch_pos_embed,
+                mode="trilinear",
+                antialias=self.interpolate_antialias,
+                **kwargs,
+            )
+            assert (d0, w0, h0) == patch_pos_embed.shape[-3:]
+            patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 4, 1).contiguous().view(1, -1, dim)
+        else:
+            patch_pos_embed = nn.functional.interpolate(
+                patch_pos_embed.reshape(1, M, M, dim).permute(0, 3, 1, 2),
+                mode="bicubic",
+                antialias=self.interpolate_antialias,
+                **kwargs,
+            )
+            assert (w0, h0) == patch_pos_embed.shape[-2:]
+            patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
 
     def prepare_tokens_with_masks(self, x, masks=None):
-        B, nc, w, h = x.shape
+        if self.is_3d:
+            B, nc, d, w, h = x.shape
+        else:
+            B, nc, w, h = x.shape
         x = self.patch_embed(x)
         if masks is not None:
+            # Ensure masks live on same device as activations
+            if masks.device != x.device:
+                masks = masks.to(x.device, non_blocking=True)
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
 
         x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
-        x = x + self.interpolate_pos_encoding(x, w, h)
+        if self.is_3d:
+            x = x + self.interpolate_pos_encoding(x, w, h, d)
+        else:
+            x = x + self.interpolate_pos_encoding(x, w, h)
 
         if self.register_tokens is not None:
             x = torch.cat(
@@ -233,9 +379,20 @@ class DinoVisionTransformer(nn.Module):
         return x
 
     def forward_features_list(self, x_list, masks_list):
-        x = [self.prepare_tokens_with_masks(x, masks) for x, masks in zip(x_list, masks_list)]
-        for blk in self.blocks:
-            x = blk(x)
+        if not self.model_parallel:
+            x = [self.prepare_tokens_with_masks(x, masks) for x, masks in zip(x_list, masks_list)]
+            for blk in self.blocks:
+                x = blk(x)
+        else:
+            # Place inputs on first device
+            first_device = self.mp_devices[0]
+            x = [xi.to(first_device, non_blocking=True) for xi in x_list]
+            x = [self.prepare_tokens_with_masks(xi, mi) for xi, mi in zip(x, masks_list)]
+            # Iterate actual blocks and move lists across devices as needed
+            for i, blk in enumerate(self._iter_all_block_modules()):
+                target = self._block_devices[i]
+                x = [xi.to(target, non_blocking=True) for xi in x]
+                x = blk(x)
 
         all_x = x
         output = []
@@ -256,10 +413,20 @@ class DinoVisionTransformer(nn.Module):
         if isinstance(x, list):
             return self.forward_features_list(x, masks)
 
-        x = self.prepare_tokens_with_masks(x, masks)
-
-        for blk in self.blocks:
-            x = blk(x)
+        if not self.model_parallel:
+            x = self.prepare_tokens_with_masks(x, masks)
+            for blk in self.blocks:
+                x = blk(x)
+        else:
+            # Move input to first stage device
+            first_device = self.mp_devices[0]
+            x = x.to(first_device, non_blocking=True)
+            x = self.prepare_tokens_with_masks(x, masks)
+            for i, blk in enumerate(self._iter_all_block_modules()):
+                target = self._block_devices[i]
+                if x.device != target:
+                    x = x.to(target, non_blocking=True)
+                x = blk(x)
 
         x_norm = self.norm(x)
         return {

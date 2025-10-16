@@ -148,7 +148,15 @@ def do_train(cfg, model, resume=False):
     ) = build_schedulers(cfg)
 
     # checkpointer
-    checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=True)
+    if getattr(model.student["backbone"], "model_parallel", False):
+        # Use a simple checkpointing when not using FSDP
+        from fvcore.common.checkpoint import Checkpointer
+
+        checkpointer = Checkpointer(
+            model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=distributed.is_main_process()
+        )
+    else:
+        checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=True)
 
     start_iter = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
 
@@ -190,25 +198,60 @@ def do_train(cfg, model, resume=False):
     )
 
     # setup data loader
+    # Set PyTorch multiprocessing sharing strategy to reduce shared memory pressure if configured
+    if hasattr(cfg.train, "shm_sharing_strategy"):
+        import torch.multiprocessing as mp
 
-    dataset = make_dataset(
-        dataset_str=cfg.train.dataset_path,
-        transform=data_transform,
-        target_transform=lambda _: (),
-    )
-    # sampler_type = SamplerType.INFINITE
-    sampler_type = SamplerType.SHARDED_INFINITE
-    data_loader = make_data_loader(
-        dataset=dataset,
-        batch_size=cfg.train.batch_size_per_gpu,
-        num_workers=cfg.train.num_workers,
-        shuffle=True,
-        seed=start_iter,  # TODO: Fix this -- cfg.train.seed
-        sampler_type=sampler_type,
-        sampler_advance=0,  # TODO(qas): fix this -- start_iter * cfg.train.batch_size_per_gpu,
-        drop_last=True,
-        collate_fn=collate_fn,
-    )
+        mp.set_sharing_strategy(str(cfg.train.shm_sharing_strategy))
+
+    if bool(cfg.train.get("use_xarray", False)):
+        from dinov2.data.loaders import make_xarray_loader
+
+        data_loader = make_xarray_loader(
+            ds_path=str(cfg.train.xarray.dataset_path),
+            image_var=str(cfg.train.xarray.image_var),
+            target_var=str(cfg.train.xarray.target_var) if cfg.train.xarray.target_var else None,
+            batch_size=int(cfg.train.batch_size_per_gpu),
+            num_workers=int(cfg.train.num_workers),
+            to_chw=bool(cfg.train.xarray.to_chw),
+            normalize=bool(cfg.train.xarray.normalize),
+            chunks=dict(cfg.train.xarray.chunks) if cfg.train.xarray.chunks else None,
+            tiling=dict(cfg.train.tiling) if hasattr(cfg.train, "tiling") else None,
+        )
+    else:
+        dataset = make_dataset(
+            dataset_str=cfg.train.dataset_path,
+            transform=data_transform,
+            target_transform=lambda _: (),
+        )
+        # Optional tiling for large inputs
+        if bool(cfg.train.get("tiling", {}).get("enabled", False)):
+            from dinov2.data.loaders import make_tiled_iterable_dataset
+
+            dataset = make_tiled_iterable_dataset(
+                dataset=dataset,
+                is_3d=bool(cfg.train.tiling.is_3d),
+                tile_size=tuple(cfg.train.tiling.tile_size),
+                stride=tuple(cfg.train.tiling.stride),
+                drop_last_tiles=bool(cfg.train.tiling.drop_last_tiles),
+                transform=dataset.transform,
+            )
+        # sampler_type = SamplerType.INFINITE
+        sampler_type = SamplerType.SHARDED_INFINITE
+        data_loader = make_data_loader(
+            dataset=dataset,
+            batch_size=cfg.train.batch_size_per_gpu,
+            num_workers=cfg.train.num_workers,
+            shuffle=True,
+            seed=start_iter,  # TODO: Fix this -- cfg.train.seed
+            sampler_type=sampler_type,
+            sampler_advance=0,  # TODO(qas): fix this -- start_iter * cfg.train.batch_size_per_gpu,
+            drop_last=True,
+            collate_fn=collate_fn,
+            pin_memory=bool(cfg.train.get("pin_memory", True)),
+            prefetch_factor=int(cfg.train.get("prefetch_factor", 2)),
+            persistent_workers=bool(cfg.train.get("persistent_workers", False)),
+        )
 
     # training loop
 
@@ -251,13 +294,22 @@ def do_train(cfg, model, resume=False):
                 fp16_scaler.unscale_(optimizer)
                 for v in model.student.values():
                     v.clip_grad_norm_(cfg.optim.clip_grad)
-            fp16_scaler.step(optimizer)
-            fp16_scaler.update()
+            if int(cfg.train.get("accumulate_steps", 1)) > 1:
+                if (iteration + 1) % int(cfg.train.get("accumulate_steps", 1)) == 0:
+                    fp16_scaler.step(optimizer)
+                    fp16_scaler.update()
+            else:
+                fp16_scaler.step(optimizer)
+                fp16_scaler.update()
         else:
             if cfg.optim.clip_grad:
                 for v in model.student.values():
                     v.clip_grad_norm_(cfg.optim.clip_grad)
-            optimizer.step()
+            if int(cfg.train.get("accumulate_steps", 1)) > 1:
+                if (iteration + 1) % int(cfg.train.get("accumulate_steps", 1)) == 0:
+                    optimizer.step()
+            else:
+                optimizer.step()
 
         # perform teacher EMA update
 
@@ -297,7 +349,21 @@ def do_train(cfg, model, resume=False):
 def main(args):
     cfg = setup(args)
 
-    model = SSLMetaArch(cfg).to(torch.device("cuda"))
+    # If backbone is configured for model-parallel, we should not move the
+    # whole container to a single device. The submodules are already placed.
+    model = SSLMetaArch(cfg)
+    if not getattr(model.student["backbone"], "model_parallel", False):
+        model = model.to(torch.device("cuda"))
+        # channels_last for 2D
+        if bool(cfg.train.get("channels_last", False)) and not bool(cfg.student.get("is_3d", False)):
+            model = model.to(memory_format=torch.channels_last)
+    # torch.compile (PT 2.0+)
+    if bool(cfg.train.get("torch_compile", False)):
+        mode = str(cfg.train.get("torch_compile_mode", "reduce-overhead"))
+        try:
+            model = torch.compile(model, mode=mode)
+        except Exception as e:
+            logger.warning(f"torch.compile failed: {e}")
     model.prepare_for_distributed_training()
 
     logger.info("Model:\n{}".format(model))

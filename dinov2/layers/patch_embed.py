@@ -22,6 +22,14 @@ def make_2tuple(x):
     return (x, x)
 
 
+def make_3tuple(x):
+    if isinstance(x, tuple):
+        assert len(x) == 3
+        return x
+    assert isinstance(x, int)
+    return (x, x, x)
+
+
 class PatchEmbed(nn.Module):
     """
     2D image to patch embedding: (B,C,H,W) -> (B,N,D)
@@ -85,4 +93,74 @@ class PatchEmbed(nn.Module):
         flops = Ho * Wo * self.embed_dim * self.in_chans * (self.patch_size[0] * self.patch_size[1])
         if self.norm is not None:
             flops += Ho * Wo * self.embed_dim
+        return flops
+
+
+class PatchEmbed3D(nn.Module):
+    """
+    3D volume to patch embedding: (B,C,D,H,W) -> (B,N,D)
+
+    Args:
+        img_size: Volume size.
+        patch_size: Patch token size (Dz, Dy, Dx).
+        in_chans: Number of input channels.
+        embed_dim: Number of linear projection output channels.
+        norm_layer: Normalization layer.
+    """
+
+    def __init__(
+        self,
+        img_size: Union[int, Tuple[int, int, int]] = 32,
+        patch_size: Union[int, Tuple[int, int, int]] = 4,
+        in_chans: int = 1,
+        embed_dim: int = 768,
+        norm_layer: Optional[Callable] = None,
+        flatten_embedding: bool = True,
+    ) -> None:
+        super().__init__()
+
+        image_DHW = make_3tuple(img_size)
+        patch_DHW = make_3tuple(patch_size)
+        patch_grid_size = (
+            image_DHW[0] // patch_DHW[0],
+            image_DHW[1] // patch_DHW[1],
+            image_DHW[2] // patch_DHW[2],
+        )
+
+        self.img_size = image_DHW
+        self.patch_size = patch_DHW
+        self.patches_resolution = patch_grid_size
+        self.num_patches = patch_grid_size[0] * patch_grid_size[1] * patch_grid_size[2]
+
+        self.in_chans = in_chans
+        self.embed_dim = embed_dim
+
+        self.flatten_embedding = flatten_embedding
+
+        self.proj = nn.Conv3d(in_chans, embed_dim, kernel_size=patch_DHW, stride=patch_DHW)
+        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
+
+    def forward(self, x: Tensor) -> Tensor:
+        _, _, D, H, W = x.shape
+        patch_D, patch_H, patch_W = self.patch_size
+
+        assert D % patch_D == 0, f"Input depth {D} is not a multiple of patch depth {patch_D}"
+        assert H % patch_H == 0, f"Input height {H} is not a multiple of patch height {patch_H}"
+        assert W % patch_W == 0, f"Input width {W} is not a multiple of patch width {patch_W}"
+
+        x = self.proj(x)  # B C D H W
+        D, H, W = x.size(2), x.size(3), x.size(4)
+        x = x.flatten(2).transpose(1, 2)  # B DHW C
+        x = self.norm(x)
+        if not self.flatten_embedding:
+            x = x.reshape(-1, D, H, W, self.embed_dim)  # B D H W C
+        return x
+
+    def flops(self) -> float:
+        Do, Ho, Wo = self.patches_resolution
+        flops = Do * Ho * Wo * self.embed_dim * self.in_chans * (
+            self.patch_size[0] * self.patch_size[1] * self.patch_size[2]
+        )
+        if self.norm is not None:
+            flops += Do * Ho * Wo * self.embed_dim
         return flops
