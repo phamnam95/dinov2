@@ -6,8 +6,10 @@
 from functools import partial
 import logging
 
+import math
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
 
 from dinov2.loss import DINOLoss, iBOTPatchLoss, KoLeoLoss
@@ -45,9 +47,17 @@ class SSLMetaArch(nn.Module):
         logger.info(f"OPTIONS -- architecture : embed_dim: {embed_dim}")
 
         if cfg.student.pretrained_weights:
-            chkpt = torch.load(cfg.student.pretrained_weights)
+            chkpt = torch.load(cfg.student.pretrained_weights, map_location="cpu")
             logger.info(f"OPTIONS -- pretrained weights: loading from {cfg.student.pretrained_weights}")
-            student_backbone.load_state_dict(chkpt["model"], strict=False)
+            state = chkpt.get("model", chkpt)
+            # If 3D backbone but checkpoint is 2D, adapt weights
+            if getattr(student_backbone, "is_3d", False):
+                state = self._adapt_2d_backbone_state_for_3d(student_backbone, state)
+            missing, unexpected = student_backbone.load_state_dict(state, strict=False)
+            if missing:
+                logger.info(f"pretrained load - missing keys: {len(missing)}")
+            if unexpected:
+                logger.info(f"pretrained load - unexpected keys: {len(unexpected)}")
 
         self.embed_dim = embed_dim
         self.dino_out_dim = cfg.dino.head_n_prototypes
@@ -153,6 +163,49 @@ class SSLMetaArch(nn.Module):
         self.freq_mask_per_sample = bool(getattr(fm_cfg, "per_sample", False)) if fm_cfg is not None else False
         self.freq_mask_low_range = tuple(getattr(fm_cfg, "low_range", (self.freq_mask_low, self.freq_mask_low)))
         self.freq_mask_high_range = tuple(getattr(fm_cfg, "high_range", (self.freq_mask_high, self.freq_mask_high)))
+
+    @staticmethod
+    def _adapt_2d_backbone_state_for_3d(model: nn.Module, state: dict) -> dict:
+        """Inflate 2D ViT weights to 3D for PatchEmbed and positional embeddings.
+
+        - patch_embed.proj.weight: [C_out, C_in, Kh, Kw] -> [C_out, C_in, Kd, Kh, Kw] by repeat/avg
+        - pos_embed: interpolate 2D grid to target 3D grid (D',H',W') using trilinear with depth=1 source
+        Other parameters are copied as-is.
+        """
+        new_state = dict(state)
+        # Adapt patch embedding conv
+        pe_w_key = "patch_embed.proj.weight"
+        if pe_w_key in state and state[pe_w_key].ndim == 4:
+            w2d = state[pe_w_key]  # [E, Cin, Kh, Kw]
+            kd = getattr(getattr(model, "patch_embed", None), "proj", None).weight.shape[2]
+            # Inflate by repeating along depth and average
+            w3d = w2d.unsqueeze(2).repeat(1, 1, kd, 1, 1) / kd
+            new_state[pe_w_key] = w3d
+
+        # Adapt positional embedding
+        pos_key = "pos_embed"
+        if pos_key in state:
+            pos2d = state[pos_key]  # [1, N2+1, C]
+            if pos2d.ndim == 3 and pos2d.shape[0] == 1:
+                cls_pos = pos2d[:, :1, :]
+                patch_pos = pos2d[:, 1:, :]
+                n2 = patch_pos.shape[1]
+                c = patch_pos.shape[2]
+                m = int(math.sqrt(n2))
+                if m * m == n2:
+                    target_res = getattr(getattr(model, "patch_embed", None), "patches_resolution", None)
+                    if isinstance(target_res, tuple) and len(target_res) == 3:
+                        d0, h0, w0 = target_res
+                        patch_pos_2d = patch_pos.view(1, m, m, c).permute(0, 3, 1, 2)  # [1,C,M,M]
+                        patch_pos_3d = F.interpolate(
+                            patch_pos_2d.unsqueeze(2),  # [1,C,1,M,M]
+                            size=(d0, h0, w0),
+                            mode="trilinear",
+                            align_corners=False,
+                        ).squeeze(2)
+                        patch_pos_flat = patch_pos_3d.permute(0, 2, 3, 1).reshape(1, d0 * h0 * w0, c)
+                        new_state[pos_key] = torch.cat([cls_pos, patch_pos_flat], dim=1)
+        return new_state
 
     @staticmethod
     def _broadcast_model_parameters(module_dict: nn.ModuleDict):
