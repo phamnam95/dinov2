@@ -129,6 +129,7 @@ def compute_embeddings(
     is_3d: bool,
     channels_last_npy: bool,
     use_cls: bool = True,
+    use_patch_embed: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     xs: List[torch.Tensor] = []
     ys: List[int] = []
@@ -139,8 +140,15 @@ def compute_embeddings(
             ys.append(labels[i])
             if len(xs) == batch_size or i == len(files) - 1:
                 xbatch = torch.stack(xs, dim=0).to(device, non_blocking=True)
-                out = model(xbatch, is_training=True)
-                feats = out["x_norm_clstoken"] if use_cls else out["x_norm_patchtokens"].mean(dim=1)
+                if use_patch_embed:
+                    # Extract patch embedding before transformer blocks
+                    with torch.no_grad():
+                        pe = model.patch_embed(xbatch)
+                        # Global average over tokens
+                        feats = pe.mean(dim=1)
+                else:
+                    out = model(xbatch, is_training=True)
+                    feats = out["x_norm_clstoken"] if use_cls else out["x_norm_patchtokens"].mean(dim=1)
                 feats = F.normalize(feats, dim=-1)
                 feats_np = feats.cpu().numpy()
                 if i == len(files) - 1 or len(xs) == batch_size:
@@ -229,6 +237,7 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--channels-last-npy", action="store_true", help="Set if npy arrays are channels-last")
     parser.add_argument("--use-cls", action="store_true", help="Use CLS token embedding (default). If false, avg patch tokens.")
+    parser.add_argument("--use-patch-embed", action="store_true", help="Use patch embedding (pre-transformer) averaged over tokens")
     parser.add_argument("--projection", default="umap", choices=["umap", "tsne", "pca"])
     parser.add_argument("--metrics-sample-limit", type=int, default=10000)
     parser.add_argument("--max-files-per-class", type=int, default=0)
@@ -260,6 +269,7 @@ def main():
         is_3d=args.is_3d,
         channels_last_npy=args.channels_last_npy,
         use_cls=True if args.use_cls else True,
+        use_patch_embed=bool(args.use_patch_embed),
     )
 
     # Project to 3D and plot
