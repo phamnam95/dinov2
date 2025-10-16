@@ -64,10 +64,15 @@ train:
   output_dir: .
   saveckp_freq: 20
   seed: 0
-  num_workers: 10
+  num_workers: 6
   OFFICIAL_EPOCH_LENGTH: 1250
-  cache_dataset: true
+  cache_dataset: false
   centering: "centering" # or "sinkhorn_knopp"
+  # DataLoader memory controls (tune per cluster)
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+  shm_sharing_strategy: file_system  # or 'file_descriptor'
 student:
   arch: vit_large
   patch_size: 16

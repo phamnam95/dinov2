@@ -176,6 +176,8 @@ def make_data_loader(
     drop_last: bool = True,
     persistent_workers: bool = False,
     collate_fn: Optional[Callable[[List[T]], Any]] = None,
+    pin_memory: bool = True,
+    prefetch_factor: int = 2,
 ):
     """
     Creates a data loader with the specified parameters.
@@ -209,7 +211,8 @@ def make_data_loader(
         sampler=sampler,
         batch_size=batch_size,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
         drop_last=drop_last,
         persistent_workers=persistent_workers,
         collate_fn=collate_fn,
