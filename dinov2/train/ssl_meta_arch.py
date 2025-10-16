@@ -371,15 +371,21 @@ class SSLMetaArch(nn.Module):
             self.need_to_synchronize_fsdp_streams = False
 
     def update_teacher(self, m):
-        student_param_list = []
-        teacher_param_list = []
         with torch.no_grad():
-            for k in self.student.keys():
-                for ms, mt in zip(get_fsdp_modules(self.student[k]), get_fsdp_modules(self.teacher[k])):
-                    student_param_list += ms.params
-                    teacher_param_list += mt.params
-            torch._foreach_mul_(teacher_param_list, m)
-            torch._foreach_add_(teacher_param_list, student_param_list, alpha=1 - m)
+            if any(get_fsdp_modules(self.student[k]) for k in self.student.keys()):
+                student_param_list = []
+                teacher_param_list = []
+                for k in self.student.keys():
+                    for ms, mt in zip(get_fsdp_modules(self.student[k]), get_fsdp_modules(self.teacher[k])):
+                        student_param_list += ms.params
+                        teacher_param_list += mt.params
+                torch._foreach_mul_(teacher_param_list, m)
+                torch._foreach_add_(teacher_param_list, student_param_list, alpha=1 - m)
+            else:
+                # Fallback when not using FSDP (e.g., model-parallel backbone)
+                for k in self.student.keys():
+                    for p_s, p_t in zip(self.student[k].parameters(), self.teacher[k].parameters()):
+                        p_t.mul_(m).add_(p_s, alpha=1 - m)
 
     def train(self):
         super().train()
