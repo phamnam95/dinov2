@@ -62,8 +62,12 @@ ibot:
   freq_mask:
     enabled: false
     prob: 0.5
-    low: 0.05     # normalized low cutoff (0-0.5)
-    high: 0.25    # normalized high cutoff (0-0.5)
+    # Either specify fixed cutoffs (low/high) or ranges below for per-sample sampling
+    low: 0.05        # normalized low cutoff (0..0.5)
+    high: 0.25       # normalized high cutoff (0..0.5)
+    per_sample: false
+    low_range: [0.02, 0.10]   # used when per_sample: true
+    high_range: [0.20, 0.40]  # used when per_sample: true
     mode: bandpass  # bandpass|lowpass|highpass
 train:
   batch_size_per_gpu: 64

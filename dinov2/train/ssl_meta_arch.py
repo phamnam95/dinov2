@@ -150,6 +150,9 @@ class SSLMetaArch(nn.Module):
         self.freq_mask_low = float(getattr(fm_cfg, "low", 0.0)) if fm_cfg is not None else 0.0
         self.freq_mask_high = float(getattr(fm_cfg, "high", 0.0)) if fm_cfg is not None else 0.0
         self.freq_mask_mode = str(getattr(fm_cfg, "mode", "bandpass")) if fm_cfg is not None else "bandpass"
+        self.freq_mask_per_sample = bool(getattr(fm_cfg, "per_sample", False)) if fm_cfg is not None else False
+        self.freq_mask_low_range = tuple(getattr(fm_cfg, "low_range", (self.freq_mask_low, self.freq_mask_low)))
+        self.freq_mask_high_range = tuple(getattr(fm_cfg, "high_range", (self.freq_mask_high, self.freq_mask_high)))
 
     @staticmethod
     def _broadcast_model_parameters(module_dict: nn.ModuleDict):
@@ -190,10 +193,34 @@ class SSLMetaArch(nn.Module):
 
         # Optional frequency-domain masking on inputs before teacher/student forward
         if self.freq_mask_enabled and self.freq_mask_prob > 0.0:
-            if torch.rand((), device=global_crops.device).item() < self.freq_mask_prob:
-                global_crops = self._apply_frequency_mask(global_crops, self.freq_mask_low, self.freq_mask_high, self.freq_mask_mode)
-                if local_crops.numel() > 0:
-                    local_crops = self._apply_frequency_mask(local_crops, self.freq_mask_low, self.freq_mask_high, self.freq_mask_mode)
+            if not self.freq_mask_per_sample:
+                if torch.rand((), device=global_crops.device).item() < self.freq_mask_prob:
+                    global_crops = self._apply_frequency_mask(global_crops, self.freq_mask_low, self.freq_mask_high, self.freq_mask_mode)
+                    if local_crops.numel() > 0:
+                        local_crops = self._apply_frequency_mask(local_crops, self.freq_mask_low, self.freq_mask_high, self.freq_mask_mode)
+            else:
+                # Sample-wise random cutoffs within ranges; bandpass by default
+                def _sample_cutoffs(n: int, device: torch.device):
+                    lo_min, lo_max = self.freq_mask_low_range
+                    hi_min, hi_max = self.freq_mask_high_range
+                    lows = torch.empty(n, device=device).uniform_(lo_min, lo_max)
+                    highs = torch.empty(n, device=device).uniform_(hi_min, hi_max)
+                    highs = torch.maximum(highs, lows + 1e-4)
+                    return lows, highs
+
+                # Apply to each sample independently
+                def _apply_per_sample(x: torch.Tensor):
+                    B = x.shape[0]
+                    lows, highs = _sample_cutoffs(B, x.device)
+                    out_list = []
+                    for i in range(B):
+                        out_list.append(self._apply_frequency_mask(x[i:i+1], float(lows[i].item()), float(highs[i].item()), self.freq_mask_mode))
+                    return torch.cat(out_list, dim=0)
+
+                if torch.rand((), device=global_crops.device).item() < self.freq_mask_prob:
+                    global_crops = _apply_per_sample(global_crops)
+                    if local_crops.numel() > 0:
+                        local_crops = _apply_per_sample(local_crops)
 
         masks = images["collated_masks"].to(device0, non_blocking=True)
         mask_indices_list = images["mask_indices_list"].to(device0, non_blocking=True)
