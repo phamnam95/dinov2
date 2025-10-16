@@ -93,6 +93,13 @@ train:
     chunks: {sample: 1024}
     to_chw: true
     normalize: true
+  # Tiling for large 2D/3D inputs
+  tiling:
+    enabled: false
+    is_3d: false
+    tile_size: [512, 512]      # or [D,H,W] for 3D
+    stride: [512, 512]         # or [D,H,W] for 3D
+    drop_last_tiles: true
   # Performance features
   torch_compile: false
   torch_compile_mode: reduce-overhead  # reduce-overhead|max-autotune

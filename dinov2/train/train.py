@@ -223,6 +223,18 @@ def do_train(cfg, model, resume=False):
             transform=data_transform,
             target_transform=lambda _: (),
         )
+        # Optional tiling for large inputs
+        if bool(cfg.train.get("tiling", {}).get("enabled", False)):
+            from dinov2.data.loaders import make_tiled_iterable_dataset
+
+            dataset = make_tiled_iterable_dataset(
+                dataset=dataset,
+                is_3d=bool(cfg.train.tiling.is_3d),
+                tile_size=tuple(cfg.train.tiling.tile_size),
+                stride=tuple(cfg.train.tiling.stride),
+                drop_last_tiles=bool(cfg.train.tiling.drop_last_tiles),
+                transform=dataset.transform,
+            )
         # sampler_type = SamplerType.INFINITE
         sampler_type = SamplerType.SHARDED_INFINITE
         data_loader = make_data_loader(
