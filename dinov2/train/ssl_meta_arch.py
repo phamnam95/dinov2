@@ -120,6 +120,17 @@ class SSLMetaArch(nn.Module):
             p.requires_grad = False
         logger.info(f"Student and Teacher are built: they are both {cfg.student.arch} network.")
 
+        # If backbone uses model-parallel, place heads on last device and disable FSDP stream sync
+        if getattr(self.student["backbone"], "model_parallel", False):
+            last_device = self.student["backbone"].mp_devices[-1]
+            if "dino_head" in self.student:
+                self.student["dino_head"].to(last_device)
+                self.teacher["dino_head"].to(last_device)
+            if "ibot_head" in self.student:
+                self.student["ibot_head"].to(last_device)
+                self.teacher["ibot_head"].to(last_device)
+            self.need_to_synchronize_fsdp_streams = False
+
     def forward(self, inputs):
         raise NotImplementedError
 
@@ -134,15 +145,21 @@ class SSLMetaArch(nn.Module):
         assert n_global_crops == 2
         n_local_crops = self.cfg.crops.local_crops_number
 
-        global_crops = images["collated_global_crops"].cuda(non_blocking=True)
-        local_crops = images["collated_local_crops"].cuda(non_blocking=True)
+        # Choose device for inputs: first MP device if model-parallel, else current cuda device
+        if getattr(self.student["backbone"], "model_parallel", False):
+            device0 = self.student["backbone"].mp_devices[0]
+        else:
+            device0 = torch.device("cuda")
 
-        masks = images["collated_masks"].cuda(non_blocking=True)
-        mask_indices_list = images["mask_indices_list"].cuda(non_blocking=True)
-        n_masked_patches_tensor = images["n_masked_patches"].cuda(non_blocking=True)
+        global_crops = images["collated_global_crops"].to(device0, non_blocking=True)
+        local_crops = images["collated_local_crops"].to(device0, non_blocking=True)
+
+        masks = images["collated_masks"].to(device0, non_blocking=True)
+        mask_indices_list = images["mask_indices_list"].to(device0, non_blocking=True)
+        n_masked_patches_tensor = images["n_masked_patches"].to(device0, non_blocking=True)
         n_masked_patches = mask_indices_list.shape[0]
         upperbound = images["upperbound"]
-        masks_weight = images["masks_weight"].cuda(non_blocking=True)
+            masks_weight = images["masks_weight"].to(device0, non_blocking=True)
 
         n_local_crops_loss_terms = max(n_local_crops * n_global_crops, 1)
         n_global_crops_loss_terms = (n_global_crops - 1) * n_global_crops
@@ -389,6 +406,15 @@ class SSLMetaArch(nn.Module):
 
     def prepare_for_distributed_training(self):
         logger.info("DISTRIBUTED FSDP -- preparing model for distributed training")
+        # If model-parallel is enabled on backbone, skip FSDP wrapping because
+        # FSDP cannot shard parameters spanning multiple devices in a single module.
+        if getattr(self.student["backbone"], "model_parallel", False):
+            logger.info("Model-parallel backbone detected; skipping FSDP wrapping.")
+            # Still sync teacher weights from student
+            for k in self.student.keys():
+                self.teacher[k].load_state_dict(self.student[k].state_dict())
+            return
+
         if has_batchnorms(self.student):
             raise NotImplementedError
         # below will synchronize all student subnetworks across gpus:

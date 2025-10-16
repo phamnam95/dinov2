@@ -27,6 +27,10 @@ def build_model(args, only_teacher=False, img_size=224):
             interpolate_offset=args.interpolate_offset,
             interpolate_antialias=args.interpolate_antialias,
         )
+        # Optional model-parallel devices specified in config as a list
+        mp_devices = getattr(args, "mp_devices", None)
+        if mp_devices:
+            vit_kwargs["mp_devices"] = mp_devices
         teacher = vits.__dict__[args.arch](**vit_kwargs)
         if only_teacher:
             return teacher, teacher.embed_dim
