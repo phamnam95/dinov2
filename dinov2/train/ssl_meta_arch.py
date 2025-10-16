@@ -143,6 +143,14 @@ class SSLMetaArch(nn.Module):
                 self._broadcast_model_parameters(self.student)
                 self._broadcast_model_parameters(self.teacher)
 
+        # Configure optional frequency-domain masking for iBOT inputs
+        fm_cfg = getattr(cfg.ibot, "freq_mask", None)
+        self.freq_mask_enabled = bool(getattr(fm_cfg, "enabled", False)) if fm_cfg is not None else False
+        self.freq_mask_prob = float(getattr(fm_cfg, "prob", 0.0)) if fm_cfg is not None else 0.0
+        self.freq_mask_low = float(getattr(fm_cfg, "low", 0.0)) if fm_cfg is not None else 0.0
+        self.freq_mask_high = float(getattr(fm_cfg, "high", 0.0)) if fm_cfg is not None else 0.0
+        self.freq_mask_mode = str(getattr(fm_cfg, "mode", "bandpass")) if fm_cfg is not None else "bandpass"
+
     @staticmethod
     def _broadcast_model_parameters(module_dict: nn.ModuleDict):
         if not dist.is_available() or not dist.is_initialized():
@@ -180,12 +188,19 @@ class SSLMetaArch(nn.Module):
         global_crops = images["collated_global_crops"].to(device0, non_blocking=True)
         local_crops = images["collated_local_crops"].to(device0, non_blocking=True)
 
+        # Optional frequency-domain masking on inputs before teacher/student forward
+        if self.freq_mask_enabled and self.freq_mask_prob > 0.0:
+            if torch.rand((), device=global_crops.device).item() < self.freq_mask_prob:
+                global_crops = self._apply_frequency_mask(global_crops, self.freq_mask_low, self.freq_mask_high, self.freq_mask_mode)
+                if local_crops.numel() > 0:
+                    local_crops = self._apply_frequency_mask(local_crops, self.freq_mask_low, self.freq_mask_high, self.freq_mask_mode)
+
         masks = images["collated_masks"].to(device0, non_blocking=True)
         mask_indices_list = images["mask_indices_list"].to(device0, non_blocking=True)
         n_masked_patches_tensor = images["n_masked_patches"].to(device0, non_blocking=True)
         n_masked_patches = mask_indices_list.shape[0]
         upperbound = images["upperbound"]
-            masks_weight = images["masks_weight"].to(device0, non_blocking=True)
+        masks_weight = images["masks_weight"].to(device0, non_blocking=True)
 
         n_local_crops_loss_terms = max(n_local_crops * n_global_crops, 1)
         n_global_crops_loss_terms = (n_global_crops - 1) * n_global_crops
@@ -400,6 +415,60 @@ class SSLMetaArch(nn.Module):
         self.fsdp_synchronize_streams()
 
         return loss_dict
+
+    @staticmethod
+    def _build_frequency_mask(shape_spatial: torch.Size, device: torch.device, low: float, high: float, mode: str):
+        # shape_spatial: (..., H, W) or (..., D, H, W) but we only need last 2/3
+        if len(shape_spatial) == 2:
+            H, W = shape_spatial
+            fy = torch.fft.fftfreq(H, device=device)
+            fx = torch.fft.fftfreq(W, device=device)
+            grid_y, grid_x = torch.meshgrid(fy, fx, indexing="ij")
+            r = torch.sqrt(grid_x**2 + grid_y**2)
+        elif len(shape_spatial) == 3:
+            D, H, W = shape_spatial
+            fz = torch.fft.fftfreq(D, device=device)
+            fy = torch.fft.fftfreq(H, device=device)
+            fx = torch.fft.fftfreq(W, device=device)
+            grid_z, grid_y, grid_x = torch.meshgrid(fz, fy, fx, indexing="ij")
+            r = torch.sqrt(grid_x**2 + grid_y**2 + grid_z**2)
+        else:
+            raise ValueError("Unsupported spatial rank for frequency mask")
+
+        if mode == "bandpass":
+            mask = (r >= low) & (r <= high)
+        elif mode == "lowpass":
+            mask = (r <= high)
+        elif mode == "highpass":
+            mask = (r >= low)
+        else:
+            raise ValueError(f"Unknown freq mask mode: {mode}")
+        return mask
+
+    def _apply_frequency_mask(self, x: torch.Tensor, low: float, high: float, mode: str) -> torch.Tensor:
+        # x: [N,C,H,W] or [N,C,D,H,W]
+        original_dtype = x.dtype
+        if x.dim() == 4:
+            N, C, H, W = x.shape
+            spatial = (H, W)
+            dims = (-2, -1)
+        elif x.dim() == 5:
+            N, C, D, H, W = x.shape
+            spatial = (D, H, W)
+            dims = (-3, -2, -1)
+        else:
+            return x
+
+        mask = self._build_frequency_mask(spatial, x.device, low, high, mode)
+        # Broadcast mask to [1,1,...spatial]
+        while mask.dim() < x.dim():
+            mask = mask.unsqueeze(0)
+        mask = mask.to(x.device)
+
+        X = torch.fft.fftn(x.float(), dim=dims)
+        X = X * mask
+        y = torch.fft.ifftn(X, dim=dims).real.to(original_dtype)
+        return y
 
     def fsdp_synchronize_streams(self):
         if self.need_to_synchronize_fsdp_streams:
