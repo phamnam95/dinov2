@@ -14,7 +14,7 @@ from torch import nn
 
 from dinov2.loss import DINOLoss, iBOTPatchLoss, KoLeoLoss
 from dinov2.models import build_model_from_cfg
-from dinov2.layers import DINOHead
+from dinov2.layers import DINOHead, apply_lora_to_vit
 from dinov2.utils.utils import has_batchnorms
 from dinov2.utils.param_groups import get_params_groups_with_decay, fuse_params_groups
 from dinov2.fsdp import get_fsdp_wrapper, ShardedGradScaler, get_fsdp_modules, reshard_fsdp_model
@@ -42,6 +42,18 @@ class SSLMetaArch(nn.Module):
         teacher_model_dict = dict()
 
         student_backbone, teacher_backbone, embed_dim = build_model_from_cfg(cfg)
+        # Optionally apply LoRA adapters to ViT
+        if getattr(cfg.student, "lora", None) is not None and cfg.student.lora.enabled:
+            lora_cfg = cfg.student.lora
+            student_backbone = apply_lora_to_vit(
+                student_backbone,
+                target_substrings=tuple(lora_cfg.get("targets", ["qkv", "proj", "fc1", "fc2"])),
+                r=int(lora_cfg.get("r", 8)),
+                alpha=float(lora_cfg.get("alpha", 16.0)),
+                dropout=float(lora_cfg.get("dropout", 0.0)),
+            )
+            logger.info("Applied LoRA adapters to student backbone")
+
         student_model_dict["backbone"] = student_backbone
         teacher_model_dict["backbone"] = teacher_backbone
         logger.info(f"OPTIONS -- architecture : embed_dim: {embed_dim}")

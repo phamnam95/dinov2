@@ -126,6 +126,12 @@ student:
   # Optional model-parallel device list; example to use 4 GPUs on one node
   # Set to [] or remove to disable model parallel.
   mp_devices: [0, 1, 2, 3]
+  lora:
+    enabled: false
+    r: 8
+    alpha: 16.0
+    dropout: 0.0
+    targets: ["qkv", "proj", "fc1", "fc2"]
 teacher:
   momentum_teacher: 0.992
   final_momentum_teacher: 1
