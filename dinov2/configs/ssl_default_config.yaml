@@ -93,12 +93,18 @@ train:
     chunks: {sample: 1024}
     to_chw: true
     normalize: true
+  # Performance features
+  torch_compile: false
+  torch_compile_mode: reduce-overhead  # reduce-overhead|max-autotune
+  channels_last: true  # 2D only; ignored in 3D
+  accumulate_steps: 1
 student:
   arch: vit_large
   patch_size: 16
   # set is_3d: true for 3D inputs (and then use tuple patch_size, e.g. [2,16,16])
   is_3d: false
   drop_path_rate: 0.3
+  activation_checkpointing: false
   layerscale: 1.0e-05
   drop_path_uniform: true
   pretrained_weights: ''

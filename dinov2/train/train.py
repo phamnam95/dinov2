@@ -281,13 +281,22 @@ def do_train(cfg, model, resume=False):
                 fp16_scaler.unscale_(optimizer)
                 for v in model.student.values():
                     v.clip_grad_norm_(cfg.optim.clip_grad)
-            fp16_scaler.step(optimizer)
-            fp16_scaler.update()
+            if int(cfg.train.get("accumulate_steps", 1)) > 1:
+                if (iteration + 1) % int(cfg.train.get("accumulate_steps", 1)) == 0:
+                    fp16_scaler.step(optimizer)
+                    fp16_scaler.update()
+            else:
+                fp16_scaler.step(optimizer)
+                fp16_scaler.update()
         else:
             if cfg.optim.clip_grad:
                 for v in model.student.values():
                     v.clip_grad_norm_(cfg.optim.clip_grad)
-            optimizer.step()
+            if int(cfg.train.get("accumulate_steps", 1)) > 1:
+                if (iteration + 1) % int(cfg.train.get("accumulate_steps", 1)) == 0:
+                    optimizer.step()
+            else:
+                optimizer.step()
 
         # perform teacher EMA update
 
@@ -332,6 +341,16 @@ def main(args):
     model = SSLMetaArch(cfg)
     if not getattr(model.student["backbone"], "model_parallel", False):
         model = model.to(torch.device("cuda"))
+        # channels_last for 2D
+        if bool(cfg.train.get("channels_last", False)) and not bool(cfg.student.get("is_3d", False)):
+            model = model.to(memory_format=torch.channels_last)
+    # torch.compile (PT 2.0+)
+    if bool(cfg.train.get("torch_compile", False)):
+        mode = str(cfg.train.get("torch_compile_mode", "reduce-overhead"))
+        try:
+            model = torch.compile(model, mode=mode)
+        except Exception as e:
+            logger.warning(f"torch.compile failed: {e}")
     model.prepare_for_distributed_training()
 
     logger.info("Model:\n{}".format(model))
