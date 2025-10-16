@@ -85,6 +85,8 @@ train:
 student:
   arch: vit_large
   patch_size: 16
+  # set is_3d: true for 3D inputs (and then use tuple patch_size, e.g. [2,16,16])
+  is_3d: false
   drop_path_rate: 0.3
   layerscale: 1.0e-05
   drop_path_uniform: true

@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.utils.checkpoint
 from torch.nn.init import trunc_normal_
 
-from dinov2.layers import Mlp, PatchEmbed, SwiGLUFFNFused, MemEffAttention, NestedTensorBlock as Block
+from dinov2.layers import Mlp, PatchEmbed, PatchEmbed3D, SwiGLUFFNFused, MemEffAttention, NestedTensorBlock as Block
 
 
 logger = logging.getLogger("dinov2")
@@ -66,6 +66,7 @@ class DinoVisionTransformer(nn.Module):
         num_register_tokens=0,
         interpolate_antialias=False,
         interpolate_offset=0.1,
+        is_3d: bool = False,
         mp_devices: Union[Sequence[Union[int, str, torch.device]], None] = None,
     ):
         """
@@ -101,11 +102,19 @@ class DinoVisionTransformer(nn.Module):
         self.n_blocks = depth
         self.num_heads = num_heads
         self.patch_size = patch_size
+        self.is_3d = is_3d
         self.num_register_tokens = num_register_tokens
         self.interpolate_antialias = interpolate_antialias
         self.interpolate_offset = interpolate_offset
 
-        self.patch_embed = embed_layer(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        if is_3d:
+            self.patch_embed = PatchEmbed3D(
+                img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim
+            )
+        else:
+            self.patch_embed = embed_layer(
+                img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim
+            )
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -271,42 +280,79 @@ class DinoVisionTransformer(nn.Module):
             nn.init.normal_(self.register_tokens, std=1e-6)
         named_apply(init_weights_vit_timm, self)
 
-    def interpolate_pos_encoding(self, x, w, h):
+    def interpolate_pos_encoding(self, x, w, h, d=None):
         previous_dtype = x.dtype
         npatch = x.shape[1] - 1
         N = self.pos_embed.shape[1] - 1
-        if npatch == N and w == h:
+        if not self.is_3d and npatch == N and w == h:
             return self.pos_embed
         pos_embed = self.pos_embed.float()
         class_pos_embed = pos_embed[:, 0]
         patch_pos_embed = pos_embed[:, 1:]
         dim = x.shape[-1]
-        w0 = w // self.patch_size
-        h0 = h // self.patch_size
-        M = int(math.sqrt(N))  # Recover the number of patches in each dimension
-        assert N == M * M
+        if self.is_3d:
+            assert d is not None, "depth must be provided for 3D positional encoding"
+            # patch_size may be a tuple (Dz, Dy, Dx)
+            if isinstance(self.patch_size, tuple):
+                pd, ph, pw = self.patch_size
+            else:
+                pd = ph = pw = self.patch_size
+            w0 = w // pw
+            h0 = h // ph
+            d0 = d // pd
+            M = round(N ** (1 / 3))
+            assert N == M * M * M
+        else:
+            w0 = w // self.patch_size
+            h0 = h // self.patch_size
+            M = int(math.sqrt(N))  # Recover the number of patches in each dimension
+            assert N == M * M
         kwargs = {}
         if self.interpolate_offset:
             # Historical kludge: add a small number to avoid floating point error in the interpolation, see https://github.com/facebookresearch/dino/issues/8
             # Note: still needed for backward-compatibility, the underlying operators are using both output size and scale factors
-            sx = float(w0 + self.interpolate_offset) / M
-            sy = float(h0 + self.interpolate_offset) / M
-            kwargs["scale_factor"] = (sx, sy)
+            if self.is_3d:
+                sx = float(w0 + self.interpolate_offset) / M
+                sy = float(h0 + self.interpolate_offset) / M
+                sz = float(d0 + self.interpolate_offset) / M
+                kwargs["scale_factor"] = (sx, sy, sz)
+            else:
+                sx = float(w0 + self.interpolate_offset) / M
+                sy = float(h0 + self.interpolate_offset) / M
+                kwargs["scale_factor"] = (sx, sy)
         else:
             # Simply specify an output size instead of a scale factor
-            kwargs["size"] = (w0, h0)
-        patch_pos_embed = nn.functional.interpolate(
-            patch_pos_embed.reshape(1, M, M, dim).permute(0, 3, 1, 2),
-            mode="bicubic",
-            antialias=self.interpolate_antialias,
-            **kwargs,
-        )
-        assert (w0, h0) == patch_pos_embed.shape[-2:]
-        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
+            if self.is_3d:
+                kwargs["size"] = (d0, w0, h0)
+            else:
+                kwargs["size"] = (w0, h0)
+        if self.is_3d:
+            # reshape to (1, C, D, H, W)
+            patch_pos_embed = patch_pos_embed.reshape(1, M, M, M, dim).permute(0, 4, 1, 2, 3)
+            patch_pos_embed = nn.functional.interpolate(
+                patch_pos_embed,
+                mode="trilinear",
+                antialias=self.interpolate_antialias,
+                **kwargs,
+            )
+            assert (d0, w0, h0) == patch_pos_embed.shape[-3:]
+            patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 4, 1).contiguous().view(1, -1, dim)
+        else:
+            patch_pos_embed = nn.functional.interpolate(
+                patch_pos_embed.reshape(1, M, M, dim).permute(0, 3, 1, 2),
+                mode="bicubic",
+                antialias=self.interpolate_antialias,
+                **kwargs,
+            )
+            assert (w0, h0) == patch_pos_embed.shape[-2:]
+            patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(previous_dtype)
 
     def prepare_tokens_with_masks(self, x, masks=None):
-        B, nc, w, h = x.shape
+        if self.is_3d:
+            B, nc, d, w, h = x.shape
+        else:
+            B, nc, w, h = x.shape
         x = self.patch_embed(x)
         if masks is not None:
             # Ensure masks live on same device as activations
@@ -315,7 +361,10 @@ class DinoVisionTransformer(nn.Module):
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
 
         x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
-        x = x + self.interpolate_pos_encoding(x, w, h)
+        if self.is_3d:
+            x = x + self.interpolate_pos_encoding(x, w, h, d)
+        else:
+            x = x + self.interpolate_pos_encoding(x, w, h)
 
         if self.register_tokens is not None:
             x = torch.cat(

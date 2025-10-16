@@ -27,6 +27,10 @@ def build_model(args, only_teacher=False, img_size=224):
             interpolate_offset=args.interpolate_offset,
             interpolate_antialias=args.interpolate_antialias,
         )
+        # Optional 3D input support
+        is_3d = getattr(args, "is_3d", False)
+        if is_3d:
+            vit_kwargs["is_3d"] = True
         # Optional model-parallel devices specified in config as a list
         mp_devices = getattr(args, "mp_devices", None)
         if mp_devices:
