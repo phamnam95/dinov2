@@ -10,7 +10,7 @@
 from functools import partial
 import math
 import logging
-from typing import Sequence, Tuple, Union, Callable
+from typing import Sequence, Tuple, Union, Callable, List
 
 import numpy as np
 import torch
@@ -178,7 +178,7 @@ class DinoVisionTransformer(nn.Module):
 
     # -------------------- Model Parallel Helpers --------------------
     def _normalize_devices(self, mp_devices: Sequence[Union[int, str, torch.device]]):
-        devices: list[torch.device] = []
+        devices: List[torch.device] = []
         for d in mp_devices:
             if isinstance(d, torch.device):
                 devices.append(d)
@@ -233,11 +233,11 @@ class DinoVisionTransformer(nn.Module):
             # We could support this by moving sub-blocks individually, but it's error-prone.
             raise NotImplementedError("Model parallel is not supported when block_chunks > 0")
 
-        self.mp_devices: list[torch.device] = devices
+        self.mp_devices: List[torch.device] = devices
         self.stage_splits = self._compute_stage_splits(self.n_blocks, len(devices))
 
         # Build a per-block device map
-        block_devices: list[torch.device] = [devices[0]] * self.n_blocks
+        block_devices: List[torch.device] = [devices[0]] * self.n_blocks
         for stage_idx, (s, e) in enumerate(self.stage_splits):
             for i in range(s, e):
                 block_devices[i] = devices[stage_idx]

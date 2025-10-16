@@ -7,6 +7,7 @@ from functools import partial
 import logging
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from dinov2.loss import DINOLoss, iBOTPatchLoss, KoLeoLoss
@@ -15,6 +16,7 @@ from dinov2.layers import DINOHead
 from dinov2.utils.utils import has_batchnorms
 from dinov2.utils.param_groups import get_params_groups_with_decay, fuse_params_groups
 from dinov2.fsdp import get_fsdp_wrapper, ShardedGradScaler, get_fsdp_modules, reshard_fsdp_model
+import dinov2.distributed as distributed
 
 from dinov2.models.vision_transformer import BlockChunk
 
@@ -122,6 +124,12 @@ class SSLMetaArch(nn.Module):
 
         # If backbone uses model-parallel, place heads on last device and disable FSDP stream sync
         if getattr(self.student["backbone"], "model_parallel", False):
+            # Require single process per node when using intra-node model-parallel
+            if distributed.get_local_size() != 1:
+                raise RuntimeError(
+                    "Model-parallel backbone requires one process per node (LOCAL_WORLD_SIZE=1). "
+                    "Launch with torchrun --nproc_per_node=1 and set student.mp_devices to GPUs per node."
+                )
             last_device = self.student["backbone"].mp_devices[-1]
             if "dino_head" in self.student:
                 self.student["dino_head"].to(last_device)
@@ -130,6 +138,24 @@ class SSLMetaArch(nn.Module):
                 self.student["ibot_head"].to(last_device)
                 self.teacher["ibot_head"].to(last_device)
             self.need_to_synchronize_fsdp_streams = False
+            # Broadcast initial weights across nodes when distributed is enabled
+            if distributed.get_global_size() > 1:
+                self._broadcast_model_parameters(self.student)
+                self._broadcast_model_parameters(self.teacher)
+
+    @staticmethod
+    def _broadcast_model_parameters(module_dict: nn.ModuleDict):
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        # Use device0 per process to perform NCCL broadcasts to remain compatible with single-device NCCL groups
+        device0 = torch.device("cuda:0")
+        for m in module_dict.values():
+            for p in m.state_dict().values():
+                if isinstance(p, torch.Tensor):
+                    tmp = p.to(device0, non_blocking=True)
+                    dist.broadcast(tmp, src=0)
+                    if tmp.data_ptr() != p.data_ptr():
+                        p.copy_(tmp.to(p.device, non_blocking=True))
 
     def forward(self, inputs):
         raise NotImplementedError
@@ -357,6 +383,19 @@ class SSLMetaArch(nn.Module):
             loss_accumulator += self.ibot_loss_weight * ibot_patch_loss
 
         self.backprop_loss(loss_accumulator)
+
+        # Average gradients across nodes when using model-parallel without FSDP/DDP
+        if getattr(self.student["backbone"], "model_parallel", False) and distributed.get_global_size() > 1:
+            world_size = distributed.get_global_size()
+            device0 = torch.device("cuda:0")
+            for sub in self.student.values():
+                for p in sub.parameters():
+                    if p.grad is None:
+                        continue
+                    tmp = p.grad.detach().to(device0, non_blocking=True)
+                    dist.all_reduce(tmp, op=dist.ReduceOp.SUM)
+                    tmp.div_(world_size)
+                    p.grad.copy_(tmp.to(p.grad.device, non_blocking=True))
 
         self.fsdp_synchronize_streams()
 

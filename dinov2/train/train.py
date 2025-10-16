@@ -148,7 +148,15 @@ def do_train(cfg, model, resume=False):
     ) = build_schedulers(cfg)
 
     # checkpointer
-    checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=True)
+    if getattr(model.student["backbone"], "model_parallel", False):
+        # Use a simple checkpointing when not using FSDP
+        from fvcore.common.checkpoint import Checkpointer
+
+        checkpointer = Checkpointer(
+            model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=distributed.is_main_process()
+        )
+    else:
+        checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=True)
 
     start_iter = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
 
