@@ -373,6 +373,7 @@ def make_xarray_loader(
     to_chw: bool = True,
     normalize: bool = True,
     chunks: Optional[dict] = None,
+    tiling: Optional[dict] = None,
 ):
     if not _XR_AVAILABLE:
         raise RuntimeError("xarray/xbatcher not available; please install xarray and xbatcher.")
@@ -386,7 +387,37 @@ def make_xarray_loader(
 
     # Expect a leading sample dimension; name may vary
     sample_dim = img.dims[0]
-    bg = BatchGenerator(ds, input_dims={image_var: {sample_dim: batch_size}}, shuffle=True)
+    if tiling and tiling.get("enabled", False):
+        # Determine spatial dims for tiling
+        is_3d = bool(tiling.get("is_3d", False))
+        tile_size = tuple(tiling.get("tile_size"))
+        stride = tuple(tiling.get("stride"))
+
+        # Build dimension dict for xbatcher: batch over samples and window over spatial dims
+        if is_3d:
+            # assume dims: (sample, D, H, W, C) or (sample, C, D, H, W)
+            spatial_dims = [d for d in img.dims if d not in (sample_dim,)]
+            # pick last 3 as D,H,W
+            dhw = spatial_dims[-3:]
+            input_dims = {
+                image_var: {
+                    sample_dim: batch_size,
+                    dhw[0]: tile_size[0],
+                    dhw[1]: tile_size[1],
+                    dhw[2]: tile_size[2],
+                }
+            }
+            bg = BatchGenerator(ds, input_dims=input_dims, steps={dhw[0]: stride[0], dhw[1]: stride[1], dhw[2]: stride[2]}, shuffle=True)
+        else:
+            # 2D: pick last 2 spatial dims as H,W
+            spatial_dims = [d for d in img.dims if d not in (sample_dim,)]
+            hw = spatial_dims[-2:]
+            input_dims = {
+                image_var: {sample_dim: batch_size, hw[0]: tile_size[0], hw[1]: tile_size[1]}
+            }
+            bg = BatchGenerator(ds, input_dims=input_dims, steps={hw[0]: stride[0], hw[1]: stride[1]}, shuffle=True)
+    else:
+        bg = BatchGenerator(ds, input_dims={image_var: {sample_dim: batch_size}}, shuffle=True)
 
     def _to_tensor(npx):
         import numpy as np

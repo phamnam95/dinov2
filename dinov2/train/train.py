@@ -216,6 +216,7 @@ def do_train(cfg, model, resume=False):
             to_chw=bool(cfg.train.xarray.to_chw),
             normalize=bool(cfg.train.xarray.normalize),
             chunks=dict(cfg.train.xarray.chunks) if cfg.train.xarray.chunks else None,
+            tiling=dict(cfg.train.tiling) if hasattr(cfg.train, "tiling") else None,
         )
     else:
         dataset = make_dataset(
