@@ -11,6 +11,13 @@ import torch
 from torch.utils.data import Sampler
 
 from .datasets import ImageNet, ImageNet22k
+
+try:
+    import xarray as xr  # type: ignore
+    from xbatcher import BatchGenerator  # type: ignore
+    _XR_AVAILABLE = True
+except Exception:
+    _XR_AVAILABLE = False
 from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
 
 
@@ -223,3 +230,51 @@ def make_data_loader(
     except TypeError:  # data loader has no length
         logger.info("infinite data loader")
     return data_loader
+
+
+def make_xarray_loader(
+    *,
+    ds_path: str,
+    image_var: str,
+    target_var: Optional[str] = None,
+    batch_size: int,
+    num_workers: int = 0,
+    to_chw: bool = True,
+    normalize: bool = True,
+    chunks: Optional[dict] = None,
+):
+    if not _XR_AVAILABLE:
+        raise RuntimeError("xarray/xbatcher not available; please install xarray and xbatcher.")
+
+    ds = xr.open_zarr(ds_path) if ds_path.endswith(".zarr") else xr.open_dataset(ds_path)
+    if chunks:
+        ds = ds.chunk(chunks)
+
+    img = ds[image_var]
+    tgt = ds[target_var] if target_var and target_var in ds else None
+
+    # Expect a leading sample dimension; name may vary
+    sample_dim = img.dims[0]
+    bg = BatchGenerator(ds, input_dims={image_var: {sample_dim: batch_size}}, shuffle=True)
+
+    def _to_tensor(npx):
+        import numpy as np
+        import torch
+
+        arr = npx.values  # NumPy array
+        if to_chw and arr.shape[-1] in (1, 3):
+            arr = arr.transpose(0, 3, 1, 2)
+        t = torch.from_numpy(arr).float()
+        if normalize:
+            t = t / 255.0
+        return t
+
+    def _iter():
+        for batch in bg:
+            images = _to_tensor(batch[image_var])
+            targets = None
+            if tgt is not None:
+                targets = torch.from_numpy(batch[target_var].values)
+            yield [(dict(global_crops=[img for img in images[:2]], local_crops=list(images[2:])), targets)]
+
+    return _iter()

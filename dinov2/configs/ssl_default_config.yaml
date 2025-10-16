@@ -73,6 +73,15 @@ train:
   prefetch_factor: 2
   persistent_workers: true
   shm_sharing_strategy: file_system  # or 'file_descriptor'
+  # Optional xarray/xbatcher loader
+  use_xarray: false
+  xarray:
+    dataset_path: ''  # path to Zarr/NetCDF dataset
+    image_var: 'image'  # [H,W,C] or [C,H,W]
+    target_var: ''
+    chunks: {sample: 1024}
+    to_chw: true
+    normalize: true
 student:
   arch: vit_large
   patch_size: 16

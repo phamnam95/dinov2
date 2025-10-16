@@ -198,34 +198,47 @@ def do_train(cfg, model, resume=False):
     )
 
     # setup data loader
-
-    dataset = make_dataset(
-        dataset_str=cfg.train.dataset_path,
-        transform=data_transform,
-        target_transform=lambda _: (),
-    )
-    # sampler_type = SamplerType.INFINITE
-    sampler_type = SamplerType.SHARDED_INFINITE
     # Set PyTorch multiprocessing sharing strategy to reduce shared memory pressure if configured
     if hasattr(cfg.train, "shm_sharing_strategy"):
         import torch.multiprocessing as mp
 
         mp.set_sharing_strategy(str(cfg.train.shm_sharing_strategy))
 
-    data_loader = make_data_loader(
-        dataset=dataset,
-        batch_size=cfg.train.batch_size_per_gpu,
-        num_workers=cfg.train.num_workers,
-        shuffle=True,
-        seed=start_iter,  # TODO: Fix this -- cfg.train.seed
-        sampler_type=sampler_type,
-        sampler_advance=0,  # TODO(qas): fix this -- start_iter * cfg.train.batch_size_per_gpu,
-        drop_last=True,
-        collate_fn=collate_fn,
-        pin_memory=bool(cfg.train.get("pin_memory", True)),
-        prefetch_factor=int(cfg.train.get("prefetch_factor", 2)),
-        persistent_workers=bool(cfg.train.get("persistent_workers", False)),
-    )
+    if bool(cfg.train.get("use_xarray", False)):
+        from dinov2.data.loaders import make_xarray_loader
+
+        data_loader = make_xarray_loader(
+            ds_path=str(cfg.train.xarray.dataset_path),
+            image_var=str(cfg.train.xarray.image_var),
+            target_var=str(cfg.train.xarray.target_var) if cfg.train.xarray.target_var else None,
+            batch_size=int(cfg.train.batch_size_per_gpu),
+            num_workers=int(cfg.train.num_workers),
+            to_chw=bool(cfg.train.xarray.to_chw),
+            normalize=bool(cfg.train.xarray.normalize),
+            chunks=dict(cfg.train.xarray.chunks) if cfg.train.xarray.chunks else None,
+        )
+    else:
+        dataset = make_dataset(
+            dataset_str=cfg.train.dataset_path,
+            transform=data_transform,
+            target_transform=lambda _: (),
+        )
+        # sampler_type = SamplerType.INFINITE
+        sampler_type = SamplerType.SHARDED_INFINITE
+        data_loader = make_data_loader(
+            dataset=dataset,
+            batch_size=cfg.train.batch_size_per_gpu,
+            num_workers=cfg.train.num_workers,
+            shuffle=True,
+            seed=start_iter,  # TODO: Fix this -- cfg.train.seed
+            sampler_type=sampler_type,
+            sampler_advance=0,  # TODO(qas): fix this -- start_iter * cfg.train.batch_size_per_gpu,
+            drop_last=True,
+            collate_fn=collate_fn,
+            pin_memory=bool(cfg.train.get("pin_memory", True)),
+            prefetch_factor=int(cfg.train.get("prefetch_factor", 2)),
+            persistent_workers=bool(cfg.train.get("persistent_workers", False)),
+        )
 
     # training loop
 
